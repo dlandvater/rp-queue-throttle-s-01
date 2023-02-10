@@ -4,6 +4,7 @@ import (
 	"cloud.google.com/go/pubsub"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 )
@@ -33,14 +34,12 @@ func verifyMessage(w http.ResponseWriter, r *http.Request) bool {
 		http.Error(w, "Bad token", http.StatusBadRequest)
 		return false
 	}
-
 	msg := &pushRequest{}
 	if err := json.NewDecoder(r.Body).Decode(msg); err != nil {
 		http.Error(w, fmt.Sprintf("Could not decode body: %v", err), http.StatusBadRequest)
 		return true
 	}
-
 	MsgId = msg.Message.ID
-
+	log.Printf("message ID", MsgId)
 	return true
 }

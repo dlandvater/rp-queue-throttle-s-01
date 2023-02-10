@@ -2,7 +2,6 @@ package main
 
 import (
 	"cloud.google.com/go/spanner"
-	"database/sql"
 	"fmt"
 	"google.golang.org/api/iterator"
 	"log"
@@ -68,11 +67,13 @@ func insertErrorLog(orgId string, itemId string, locationId string, err error, s
 	rowId := createRowId(orgId, "error_log")
 
 	m := []*spanner.Mutation{
-		spanner.InsertOrUpdate("error_log", sCol, []interface{}{rowId, orgId, itemId, locationId, time.Now(),
+		spanner.InsertOrUpdate("error_log", sCol, []interface{}{rowId, orgId, time.Now(), itemId, locationId,
 			errSource, errMsg}),
 	}
 	_, err = dataClient.Apply(ctx, m)
-	log.Printf("write error log rp-queue-throttle", err)
+	if err != nil {
+		log.Printf("write error log rp-queue-throttle", err)
+	}
 }
 
 func insertBatchLog(orgId string, bMsg string) {
@@ -90,102 +91,7 @@ func insertBatchLog(orgId string, bMsg string) {
 	log.Printf("write error log rp-queue-throttle", err)
 }
 
-// Get queue triggers forecast or supply - first in first out
-func queryQueueRowsFcstSuply(queueType string, selectSize int) ([]QueueFcstSuply, int32) {
-
-	var queue []QueueFcstSuply
-	var count int32 = 0
-
-	sSQL := "SELECT org_id, item_id, location_id, MIN(trigger_time) "
-	switch queueType {
-	case "forecast":
-		sSQL = sSQL + "FROM queue_forecast "
-	case "supply":
-		sSQL = sSQL + "FROM queue_supply "
-	default:
-		fmt.Println("Invalid queue type")
-	}
-	sSQL = sSQL + fmt.Sprintf("GROUP BY org_id, item_id, location_id "+
-		"ORDER BY MIN(trigger_time) DESC LIMIT %v ;", selectSize)
-
-	stmt := spanner.Statement{SQL: sSQL}
-	iter := dataClient.Single().Query(ctx, stmt)
-	defer iter.Stop()
-	for {
-		row, err := iter.Next()
-		if err == iterator.Done {
-			return queue, count
-		}
-		if err != nil {
-			// No organization has been determined yet
-			insertErrorLog("0", "", "", err, 1)
-			return queue, count
-		}
-		nextQueueRow := QueueFcstSuply{}
-		if err2 := row.Columns(&nextQueueRow.OrgId, &nextQueueRow.ItemId, &nextQueueRow.LocationId,
-			&nextQueueRow.TriggerTime); err2 != nil {
-			// No organization has been determined yet
-			insertErrorLog("0", "", "", err, 1)
-			return queue, count
-		}
-	}
-	return queue, count
-}
-
-// Get queue triggers for on-hand on-order - first in first out
-func queryQueueRowsOnHandOnOrder(selectSize int) ([]QueueOnHandOnOrder, []ListOnHandOnOrder) {
-
-	//TODO may need to change this to a series of single SKU queries if the IN clause list gets too large (selectSize)
-
-	//See explanation in calling function, works differently from the forecast/supply queues.
-
-	//Step 1 - get list of SKUs
-	list := createOnHandOnOrderList(selectSize)
-
-	//Step 2 - Create IN clause from list of SKUs
-	INclause := createInClause(list)
-
-	//Part 3 - select the rows from the list
-	queue := createOnHandOnOrderQueue(INclause, list)
-	return queue, list
-}
-
-func createOnHandOnOrderList(selectSize int) []ListOnHandOnOrder {
-
-	var list []ListOnHandOnOrder
-
-	//Should only be one OH row per SKU
-	sSQL := fmt.Sprintf("SELECT org_id, item_id, location_id "+
-		"FROM queue_on_hand_on_order "+
-		"WHERE type = 'OH' "+
-		"ORDER BY trigger_time DESC LIMIT %v ;", selectSize)
-
-	stmt := spanner.Statement{SQL: sSQL}
-	iter := dataClient.Single().Query(ctx, stmt)
-	defer iter.Stop()
-	for {
-		row, err := iter.Next()
-		if err == iterator.Done {
-			return list
-		}
-		if err != nil {
-			// No organization has been selected yet
-			insertErrorLog("0", "", "", err, 1)
-			return list
-		}
-		nextListRow := ListOnHandOnOrder{}
-		err2 := row.Columns(&nextListRow.OrgId, &nextListRow.ItemId, &nextListRow.LocationId)
-		if err2 != nil {
-			// No organization has been determined yet
-			insertErrorLog("0", "", "", err, 1)
-			return list
-		}
-		list = append(list, nextListRow)
-	}
-	return list
-}
-
-func createInClause(list []ListOnHandOnOrder) string {
+func createSkuInClause(list []ListSku) string {
 	var INclause string
 	for _, sku := range list {
 		if INclause == "" {
@@ -198,16 +104,24 @@ func createInClause(list []ListOnHandOnOrder) string {
 	return INclause
 }
 
-func createOnHandOnOrderQueue(INclause string, list []ListOnHandOnOrder) []QueueOnHandOnOrder {
+// Get queue triggers for SKU, used for forecast and supply - first in first out
+func createListSku(queueType string, selectSize int) []ListSku {
 
-	var queue []QueueOnHandOnOrder
-	var count int
+	var list []ListSku
 
-	sSQL := "SELECT org_id, type, item_id, location_id, on_hand, due_date, quantity, " +
-		"order_id, picked, ship_date, supplier_id, trigger_time " +
-		"FROM queue_on_hand_on_order " +
-		"WHERE CONCAT(org_id, '/', item_id, '/', location_id) IN " + INclause +
-		"ORDER BY org_id, item_id, location_id, type ;"
+	sSQL := "SELECT org_id, item_id, location_id, MIN(trigger_time) "
+	switch queueType {
+	case "forecast":
+		sSQL = sSQL + "FROM queue_forecast "
+	case "supply":
+		sSQL = sSQL + "FROM queue_supply "
+	case "on_hand_on_order":
+		sSQL = sSQL + "FROM queue_on_hand_on_order "
+	default:
+		fmt.Println("Invalid queue type")
+	}
+	sSQL = sSQL + fmt.Sprintf("GROUP BY org_id, item_id, location_id "+
+		"ORDER BY MIN(trigger_time) DESC LIMIT %v ;", selectSize)
 
 	stmt := spanner.Statement{SQL: sSQL}
 	iter := dataClient.Single().Query(ctx, stmt)
@@ -215,239 +129,67 @@ func createOnHandOnOrderQueue(INclause string, list []ListOnHandOnOrder) []Queue
 	for {
 		row, err := iter.Next()
 		if err == iterator.Done {
-			return queue
+			return list
 		}
 		if err != nil {
 			// No organization has been determined yet
 			insertErrorLog("0", "", "", err, 1)
-			return queue
+			return list
 		}
-		nextQueueRow := QueueOnHandOnOrder{}
-		if err2 := row.Columns(&nextQueueRow.OrgId, &nextQueueRow.TypeId, &nextQueueRow.ItemId, &nextQueueRow.LocationId,
-			&nextQueueRow.OnHand, &nextQueueRow.DueDate, &nextQueueRow.OrderQuantity, &nextQueueRow.OrderId,
-			&nextQueueRow.Picked, &nextQueueRow.ShipDate, &nextQueueRow.Supplier, &nextQueueRow.TriggerTime); err2 != nil {
-			// No organization has been selected yet
+		nextListRow := ListSku{}
+		if err2 := row.Columns(&nextListRow.OrgId, &nextListRow.ItemId, &nextListRow.LocationId,
+			&nextListRow.TriggerTime); err2 != nil {
+			// No organization has been determined yet
 			insertErrorLog("0", "", "", err, 1)
-			return queue
-		}
-		queue = append(queue, nextQueueRow)
-		count++
-	}
-	return queue
-}
-
-// Get queue triggers for sales history - first in first out
-func queryQueueRowsSalesHistory(selectSize int) ([]QueueSalesHistory, []ListSalesHistory, int32) {
-
-	var list []ListSalesHistory
-	var INclause string
-	var queue []QueueSalesHistory
-	var count int32 = 0
-
-	//TODO may need to change this to a series of single SKU queries if the IN clause list gets too large (selectSize)
-
-	//Should only be one weekly sales history row per item/loction/postal code, additional rows will be rejected in monitor-sh
-	//See explanation in calling function, works differently from the forecast/supply queues.
-
-	//Step 1 - get list of SKUs
-	//Note: could be duplicates in this list
-	sSQL1 := fmt.Sprintf("SELECT org_id, item_id, location_id "+
-		"FROM queue_sales_history "+
-		"ORDER BY trigger_time DESC LIMIT %v ;", selectSize)
-
-	rows1, err1 := db.Query(sSQL1)
-	defer rows1.Close()
-	if err1 != nil {
-		sourceString := errorSource(err1, 1)
-		fmt.Println("Error preparing query queue sales history 1: ", "", "", "", sourceString, err1)
-		errorLog := ErrorLog{"", "", "", 1, err1}
-		insertErrorLog(errorLog, db)
-		return queue, list, count
-	}
-
-	for rows1.Next() {
-		nextListRow := ListSalesHistory{}
-		err2 := rows1.Scan(&nextListRow.OrgId, &nextListRow.ItemId, &nextListRow.LocationId)
-		if err2 != nil {
-			sourceString := errorSource(err2, 1)
-			fmt.Println("Error query queue sales history 2: ", "", "", "", sourceString, err2)
-			errorLog := ErrorLog{"", "", "", 1, err2}
-			insertErrorLog(errorLog, db)
-			return queue, list, count
+			return list
 		}
 		list = append(list, nextListRow)
 	}
-
-	//Step 2 - Create IN clause from list of SKUs
-	for _, sku := range list {
-		if INclause == "" {
-			INclause = sku.OrgId + "/" + sku.ItemId + "/" + sku.LocationId
-		} else {
-			INclause = INclause + "','" + sku.OrgId + "/" + sku.ItemId + "/" + sku.LocationId
-		}
-	}
-	INclause = "('" + INclause + "') "
-
-	//Part 3 - select the rows from the list
-	sSQL3 := "SELECT org_id, item_id, location_id, postal_code, start_date, sale_qty, " +
-		"promotion, abnormal_demand, adjusted_sale_qty, trigger_time " +
-		"FROM queue_sales_history " +
-		"WHERE CONCAT_WS('/', org_id, item_id, location_id) IN " + INclause +
-		"ORDER BY org_id, item_id, location_id, postal_code ;"
-
-	rows3, err3 := db.Query(sSQL3)
-	defer rows3.Close()
-	if err3 != nil {
-		sourceString := errorSource(err3, 1)
-		fmt.Println("Error preparing query queue sales history 3: ", "", "", "", sourceString, err3)
-		errorLog := ErrorLog{"", "", "", 1, err3}
-		insertErrorLog(errorLog, db)
-		return queue, list, count
-	}
-
-	for rows3.Next() {
-		nextQueueRow := QueueSalesHistory{}
-		err4 := rows3.Scan(&nextQueueRow.OrgId, &nextQueueRow.ItemId, &nextQueueRow.LocationId,
-			&nextQueueRow.PostalCode, &nextQueueRow.StartDate, &nextQueueRow.SaleQuantity, &nextQueueRow.Promotion,
-			&nextQueueRow.AbnormalDemand, &nextQueueRow.AdjustedSaleQty, &nextQueueRow.TriggerTime)
-
-		if err4 != nil {
-			sourceString := errorSource(err4, 1)
-			fmt.Println("Error query queue sales history 4: ", "", "", "", sourceString, err4)
-			errorLog := ErrorLog{"", "", "", 1, err4}
-			insertErrorLog(errorLog, db)
-			return queue, list, count
-		}
-		queue = append(queue, nextQueueRow)
-		count++
-	}
-	return queue, list, count
+	return list
 }
 
-// Delete published forecast / supply triggers from the queue
-func deleteQueueRowsFcstSuply(queueType string, message MessageFcstSuply) int32 {
+// Delete published triggers from the forecast or supply queue table
+func deleteQueueFcstSply(queueType string, messages []MessageSku) {
 
-	var sSQL string
-	var err error
-	var res sql.Result
-
-	if QueueDeleteStmtFcst == nil {
-		sSQL = "DELETE FROM queue_forecast WHERE org_id = ? AND item_id = ? AND location_id = ? ;"
-		QueueDeleteStmtFcst, err = db.Prepare(sSQL)
-		if err != nil {
-			sourceString := errorSource(err, 1)
-			fmt.Println("Error preparing delete queue fcst:", message.OrgId, message.ItemId, message.LocationId, sourceString, err)
-			errorLog := ErrorLog{message.OrgId, message.ItemId, message.LocationId, 1, err}
-			insertErrorLog(errorLog, db)
-			return 0
-		}
-	}
-	if QueueDeleteStmtSuply == nil {
-		sSQL = "DELETE FROM queue_supply WHERE org_id = ? AND item_id = ? AND location_id = ? ;"
-		QueueDeleteStmtSuply, err = db.Prepare(sSQL)
-		if err != nil {
-			sourceString := errorSource(err, 1)
-			fmt.Println("Error preparing delete queue suply:", message.OrgId, message.ItemId, message.LocationId, sourceString, err)
-			errorLog := ErrorLog{message.OrgId, message.ItemId, message.LocationId, 1, err}
-			insertErrorLog(errorLog, db)
-			return 0
-		}
-	}
+	var deleteFromTable string
 
 	switch queueType {
 	case "forecast":
-		res, err = QueueDeleteStmtFcst.Exec(message.OrgId, message.ItemId, message.LocationId)
+		deleteFromTable = "queue_forecast"
 	case "supply":
-		res, err = QueueDeleteStmtSuply.Exec(message.OrgId, message.ItemId, message.LocationId)
+		deleteFromTable = "queue_supply"
 	default:
-		fmt.Println("Invalid queue type")
-	}
-	if err != nil {
-		sourceString := errorSource(err, 1)
-		fmt.Println("Error delete queue:", message.OrgId, message.ItemId, message.LocationId, sourceString, err)
-		errorLog := ErrorLog{message.OrgId, message.ItemId,
-			message.LocationId, 1, err}
-		insertErrorLog(errorLog, db)
-		return 0
+		log.Println("Invalid queue type")
+		message := messages[0]
+		insertErrorLog(message.OrgId, message.ItemId, message.LocationId, err, 1)
 	}
 
-	// affected rows
-	rowCount, err := res.RowsAffected()
-	if err != nil {
-		return 0
-	}
+	// uses slice of mutations
+	var m *spanner.Mutation
+	var mm []*spanner.Mutation
+	var counter int
 
-	return int32(rowCount)
-}
+	for _, message := range messages {
+		m = spanner.Delete(deleteFromTable, spanner.Key{message.OrgId, message.ItemId, message.LocationId})
+		mm = append(mm, m)
 
-// Delete published on-hand on-order triggers from the queue
-func deleteQueueRowsOnHandOnOrder(sku ListOnHandOnOrder) int32 {
-
-	var err error
-
-	sSQL := "DELETE FROM queue_on_hand_on_order WHERE org_id = ? AND item_id = ? AND location_id = ? ;"
-
-	if QueueDeleteStmtOnHandOnOrder == nil {
-		QueueDeleteStmtOnHandOnOrder, err = db.Prepare(sSQL)
-		if err != nil {
-			sourceString := errorSource(err, 1)
-			fmt.Println("Error preparing delete queue OH OO:", sku.OrgId, sku.ItemId, sku.LocationId, sourceString, err)
-			errorLog := ErrorLog{sku.OrgId, sku.ItemId, sku.LocationId, 1, err}
-			insertErrorLog(errorLog, db)
-			return 0
+		// Prevent exceeding mutation max: one mutation per net change trigger
+		counter++
+		if counter > 5000 {
+			_, err := dataClient.Apply(ctx, mm)
+			if err != nil {
+				insertErrorLog(message.OrgId, message.ItemId, message.LocationId, err, 1)
+			}
+			fmt.Println("break delete SKU mutation, counter:", counter)
+			mm = nil
+			counter = 0
 		}
 	}
-
-	res, err := QueueDeleteStmtOnHandOnOrder.Exec(sku.OrgId, sku.ItemId, sku.LocationId)
-	if err != nil {
-		sourceString := errorSource(err, 1)
-		fmt.Println("Error delete queue OH OO:", sku.OrgId, sku.ItemId, sku.LocationId, sourceString, err)
-		errorLog := ErrorLog{sku.OrgId, sku.ItemId, sku.LocationId, 1, err}
-		insertErrorLog(errorLog, db)
-		return 0
-	}
-
-	// affected rows
-	rowCount, err := res.RowsAffected()
-	if err != nil {
-		return 0
-	}
-
-	return int32(rowCount)
-}
-
-// Delete published sales history triggers from the queue
-func deleteQueueRowsSalesHistory(sku ListSalesHistory) int32 {
-
-	var err error
-
-	sSQL := "DELETE FROM queue_sales_history WHERE org_id = ? AND item_id = ? AND location_id = ? ;"
-
-	if QueueDeleteStmtSalesHistory == nil {
-		QueueDeleteStmtSalesHistory, err = db.Prepare(sSQL)
+	if len(mm) > 0 {
+		_, err := dataClient.Apply(ctx, mm)
 		if err != nil {
-			sourceString := errorSource(err, 1)
-			fmt.Println("Error preparing delete queue SH:", sku.OrgId, sku.ItemId, sku.LocationId, sourceString, err)
-			errorLog := ErrorLog{sku.OrgId, sku.ItemId, sku.LocationId, 1, err}
-			insertErrorLog(errorLog, db)
-			return 0
+			message := messages[0]
+			insertErrorLog(message.OrgId, message.ItemId, message.LocationId, err, 1)
 		}
 	}
-
-	res, err := QueueDeleteStmtSalesHistory.Exec(sku.OrgId, sku.ItemId, sku.LocationId)
-	if err != nil {
-		sourceString := errorSource(err, 1)
-		fmt.Println("Error delete queue SH:", sku.OrgId, sku.ItemId, sku.LocationId, sourceString, err)
-		errorLog := ErrorLog{sku.OrgId, sku.ItemId, sku.LocationId, 1, err}
-		insertErrorLog(errorLog, db)
-		return 0
-	}
-
-	// affected rows
-	rowCount, err := res.RowsAffected()
-	if err != nil {
-		return 0
-	}
-
-	return int32(rowCount)
 }

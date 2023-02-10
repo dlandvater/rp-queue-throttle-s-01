@@ -1,0 +1,19 @@
+runtime: go119
+
+instance_class: F1
+
+automatic_scaling:
+  min_instances: 0
+  max_instances: 10
+
+env_variables:
+  GOOGLE_CLOUD_PROJECT: rp-queue-throttle-s-01
+  PUBSUB_VERIFICATION_TOKEN: 12345
+  PUBSUB_TOPIC_SUPPLY: SUPPLY
+  PUBSUB_TOPIC_FORECAST: FORECAST
+  PUBSUB_TOPIC_ON_HAND_ON_ORDER: ON_HAND
+  PUBSUB_TOPIC_SALES_HISTORY: SALES_HISTORY
+
+handlers:
+  - url: /.*
+    script: auto
