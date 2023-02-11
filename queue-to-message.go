@@ -30,7 +30,7 @@ func queueToMessageSku(queueType string, selectSize int, chunkSize int) {
 			messagesPublish = nil
 		}
 	}
-	if len(queueTriggers) > 0 {
+	if len(messagesPublish) > 0 {
 		published = publishTriggersSku(queueType, messagesPublish)
 		if published == false {
 			return
