@@ -79,7 +79,7 @@ func pushHandler(w http.ResponseWriter, r *http.Request) {
 		// Client
 		//dataClient, err = spanner.NewClient(ctx, "projects/rp-database-s-01/instances/rp-combined/databases/retail")
 		// Emulator client
-		dataClient, err = spanner.NewClient(ctx, "projects/rp-queue-throttle-s-01/instances/rp-combined/databases/retail")
+		dataClient, err = spanner.NewClient(ctx, "projects/rp-database-s-01/instances/rp-combined/databases/retail")
 		if err != nil {
 			log.Println("new spanner client error", err)
 			insertErrorLog("0", "", "", err, 1)
